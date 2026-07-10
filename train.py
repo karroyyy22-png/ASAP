@@ -6,7 +6,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
-import ruamel_yaml as yaml
+import ruamel.yaml as yaml
 import numpy as np
 import random
 import time
@@ -38,6 +38,25 @@ from tqdm import tqdm
 
 from sklearn.metrics import roc_auc_score, roc_curve, f1_score
 from scipy.optimize import brentq
+
+OMNI_FEAT_DIR = '/nas/data_2/wanhongz/ASAP'
+
+def load_omni_feats(split):
+    """加载指定split的OmniFD 512维特征查找表 (img_dir -> 512维tensor)"""
+    path = f'{OMNI_FEAT_DIR}/omnifd_{split}_feats.pt'
+    feats = torch.load(path, map_location='cpu')
+    print(f'[Omni Fusion] loaded {len(feats)} feature entries from {path}')
+    return feats
+
+def build_omni_batch(img_dirs, omni_feats, device):
+    """按img_dir列表查表拼成batch tensor，查不到的用全零占位"""
+    vecs = []
+    for d in img_dirs:
+        if d in omni_feats:
+            vecs.append(omni_feats[d])
+        else:
+            vecs.append(torch.zeros(512, dtype=torch.float32))
+    return torch.stack(vecs, dim=0).to(device, non_blocking=True)
 from scipy.interpolate import interp1d
 
 from models import box_ops
@@ -127,7 +146,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         data_loader.sampler.set_epoch(epoch)
     # scaler = GradScaler()
 
-    for i, (image, label, text, fake_image_box, fake_word_pos, W, H, real_cap,real_prom,res_fake_pos,res_fake_pos_patch) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
+    for i, (image, label, text, fake_image_box, fake_word_pos, W, H, real_cap,real_prom,res_fake_pos,res_fake_pos_patch,img_dir) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
         if config['schedular']['sched'] == 'cosine_in_step':
             scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + epoch, args, config)        
 
@@ -154,8 +173,9 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         
         # loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC,loss_Patch,loss_image_text_BIC = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos, alpha = alpha)  
         # with autocast():
+        omni_feat_batch = build_omni_batch(img_dir, omni_train_feats, device)
         loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC, lossAnother = model(
-            image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch,alpha=alpha
+            image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch,alpha=alpha, omni_feat=omni_feat_batch
         ) 
         loss = config['loss_MAC_wgt']*loss_MAC \
              + config['loss_BIC_wgt']*loss_BIC \
@@ -217,8 +237,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
 @torch.no_grad()
 def evaluation(args, model, data_loader, tokenizer, device, config):
     # test
-    model.eval() 
-    
+    model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Evaluation:'    
     
@@ -238,7 +257,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
 
-    for i, (image, label, text, fake_image_box, fake_word_pos, W, H, real_cap,real_prom,res_fake_pos,res_fake_pos_patch) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
+    for i, (image, label, text, fake_image_box, fake_word_pos, W, H, real_cap,real_prom,res_fake_pos,res_fake_pos_patch,img_dir) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
         image = image.to(device,non_blocking=True) 
         
         text_input = tokenizer(text, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False) 
@@ -249,7 +268,8 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         cap_input = text_input_adjust(cap_input, fake_word_pos, device, True)
         prom_input = text_input_adjust(prom_input, fake_word_pos, device, True)
 
-        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch,is_train=False)
+        omni_feat_batch = build_omni_batch(img_dir, omni_val_feats, device)
+        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch,is_train=False, omni_feat=omni_feat_batch)
 
         ##================= real/fake cls ========================## 
         cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
@@ -331,6 +351,11 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     Recall_tok = TP_all / (TP_all + FN_all)
     F1_tok = 2*Precision_tok*Recall_tok / (Precision_tok + Recall_tok)
 
+    
+    # print("\n========== s distribution ==========")
+    # print(f"Real images: mean={np.mean(s_vals[real_mask]):.6f}, std={np.std(s_vals[real_mask]):.6f}")
+    # print(f"Fake images: mean={np.mean(s_vals[fake_mask]):.6f}, std={np.std(s_vals[fake_mask]):.6f}")
+    # print(f"Difference (Fake - Real): {np.mean(s_vals[fake_mask]) - np.mean(s_vals[real_mask]):.6f}")
     return AUC_cls, ACC_cls, EER_cls, \
            MAP.item(), OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
            IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
@@ -394,30 +419,26 @@ def main_worker(gpu, args, config):
                                 is_trains=[True, False], 
                                 collate_fns=[None, None])
 
-    tokenizer = BertTokenizerFast.from_pretrained('../data/bert-base-uncased')
+    tokenizer = BertTokenizerFast.from_pretrained(args.text_encoder)
     # tokenizer = BertTokenizerFast.from_pretrained(args.text_encoder)
 
     #### Model #### 
     if args.log:
         print(f"Creating Model")
-    model = ASAP(args=args, config=config, text_encoder='../data/bert-base-uncased', tokenizer=tokenizer, init_deit=True)
+    model = ASAP(args=args, config=config, text_encoder='/nas/data_2/wanhongz/bert-base-uncased', tokenizer=tokenizer, init_deit=True)
     model = model.to(device)   
-        
-    arg_opt = utils.AttrDict(config['optimizer'])
-    optimizer = create_optimizer(arg_opt, model)
-    arg_sche = utils.AttrDict(config['schedular'])
-    lr_scheduler, _ = create_scheduler(arg_sche, optimizer)
-    if config['schedular']['sched'] == 'cosine_in_step':
-        args.lr = config['optimizer']['lr']
-    
+
+    global omni_train_feats, omni_val_feats
+    omni_train_feats = load_omni_feats('train')
+    omni_val_feats = load_omni_feats('val')
+
+    # ========== Omni特征融合微调：先加载checkpoint，再冻结参数，最后才建optimizer ==========
     if args.checkpoint:    
         checkpoint = torch.load(args.checkpoint, map_location='cpu') 
         state_dict = checkpoint['model'] 
         # print(state_dict.keys())                      
         if args.resume:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            start_epoch = checkpoint['epoch']+1         
+            pass  # resume场景下optimizer/scheduler状态在下面optimizer创建后单独处理
         else:
             # print('model visual encoder:', model.visual_encoder)
             pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'],model.visual_encoder)   
@@ -429,9 +450,35 @@ def main_worker(gpu, args, config):
         # if args.log:
         #     print(msg)  
 
+    # ========== 冻结除 omni_proj/omni_fusion_fc/cls_head/itm_head 外的所有参数 ==========
+    UNFROZEN_KEYWORDS = ('omni_proj', 'omni_fusion_fc', 'cls_head', 'itm_head')
+    n_trainable = 0
+    n_frozen = 0
+    for name, param in model.named_parameters():
+        if any(kw in name for kw in UNFROZEN_KEYWORDS):
+            param.requires_grad = True
+            n_trainable += param.numel()
+        else:
+            param.requires_grad = False
+            n_frozen += param.numel()
+    if args.log:
+        print(f'[Omni Fusion] trainable params: {n_trainable:,} | frozen params: {n_frozen:,}')
+
+    arg_opt = utils.AttrDict(config['optimizer'])
+    optimizer = create_optimizer(arg_opt, model)
+    arg_sche = utils.AttrDict(config['schedular'])
+    lr_scheduler, _ = create_scheduler(arg_sche, optimizer)
+    if config['schedular']['sched'] == 'cosine_in_step':
+        args.lr = config['optimizer']['lr']
+
+    if args.checkpoint and args.resume:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        start_epoch = checkpoint['epoch']+1
+
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
     if args.log:

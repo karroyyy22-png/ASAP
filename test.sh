@@ -1,8 +1,7 @@
-EXPID='log20250412_181657_train_without_GCN'
-export CUDA_VISIBLE_DEVICES=1
+EXPID='log20260613_125731_train_4gpu_batch16'
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 HOST='127.0.0.1'
 PORT='1'
-
 NUM_GPU=1
 
 python test.py \

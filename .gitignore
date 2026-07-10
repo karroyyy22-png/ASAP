@@ -1,0 +1,37 @@
+# 缓存
+__pycache__/
+*.pyc
+
+# 日志
+*.log
+nohup.out
+eval_log*.txt
+*.log.txt
+
+# 结果、权重、大文件
+results/
+*.pth
+*.pt
+
+# 备份文件
+*.bak
+*.bak_*
+
+# 大数据文件（caption/explanation生成结果，体积可能很大）
+LargeModelScripts/*.json
+LargeModelScripts/temp/
+LargeModelScripts/*.log
+
+# 独立子项目，单独管理，不嵌入本仓库
+OmniFD/
+
+# 虚拟环境（如果有）
+.venv/
+venv/
+
+# 生成的数据文件（体积大，不适合进git）
+caption_train.json
+explanation_readable.txt
+Prompt_Generate/*.json
+asap_files.txt
+dataset/prompt_engine.json

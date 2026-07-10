@@ -43,4 +43,4 @@ loss_MLC_wgt: 1
 # schedular: {sched: cosine, lr: 1e-4, epochs: 50, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-6, warmup_epochs: 10, cooldown_epochs: 0}
 
 optimizer: {opt: adamW, lr: 1.25e-6, lr_img: 6.25e-6, weight_decay: 0.02}
-schedular: {sched: cosine, lr: 1.25e-6, epochs: 50, min_lr: 1e-7, decay_rate: 1, warmup_lr: 1e-7, warmup_epochs: 10, cooldown_epochs: 0}
+schedular: {sched: cosine, lr: 1.25e-6, epochs: 5, min_lr: 1e-7, decay_rate: 1, warmup_lr: 1e-7, warmup_epochs: 1, cooldown_epochs: 0}

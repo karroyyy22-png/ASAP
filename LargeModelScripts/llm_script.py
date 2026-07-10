@@ -2,95 +2,81 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
 import json
-from PIL import Image
 from tqdm import tqdm
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+import sys
 
-def parse():
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"]) 
-    return local_rank, world_size
+gpu_id = int(sys.argv[1])
+total_gpus = int(sys.argv[2])
 
-def setup_distributed(local_rank, world_size):
-    dist.init_process_group(backend="nccl", world_size=world_size, rank=local_rank)
-    torch.cuda.set_device(local_rank)
+model_path = '/nas/data_2/wanhongz/Qwen2.5-1.5B-Instruct'
+json_file = '/nas/data_2/wanhongz/datasets/DGM4/metadata/train.json'
+output_file = f'temp/llm_gpu{gpu_id}.json'
+BATCH_SIZE = 8
 
-def load_model(model_path, local_rank):
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True
-    ).eval()
-    model = DDP(model.to(f'cuda:{local_rank}'), device_ids=[local_rank], output_device=local_rank)
-    return model
+os.makedirs('temp', exist_ok=True)
 
-class CaptionIterableDataset(Dataset):
-    def __init__(self, json_file, root_dir, tokenizer):
-        self.json_file = json_file
-        self.root_dir = root_dir
-        self.tokenizer = tokenizer
-        with open(self.json_file, 'r') as f:
-            self.json_contents = json.load(f)
+device = 'cuda:0'
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+tokenizer.padding_side = 'left'
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    torch_dtype=torch.bfloat16,
+    device_map=device,
+    trust_remote_code=True
+).eval()
 
-    def __len__(self):
-        return len(self.json_contents)
+with open(json_file, 'r') as f:
+    ann_list = json.load(f)
+
+seen = set()
+unique_list = []
+for item in ann_list:
+    if item['image'] not in seen:
+        seen.add(item['image'])
+        unique_list.append(item)
+
+chunk_size = len(unique_list) // total_gpus
+start = gpu_id * chunk_size
+end = start + chunk_size if gpu_id < total_gpus - 1 else len(unique_list)
+my_list = unique_list[start:end]
+
+if os.path.exists(output_file):
+    with open(output_file, 'r', encoding='utf-8') as f:
+        results = json.load(f)
+    print(f'GPU{gpu_id}: 已有 {len(results)} 条，继续从断点跑')
+else:
+    results = {}
+
+my_list = [item for item in my_list if item['image'] not in results]
+print(f'GPU{gpu_id}: 需处理 {len(my_list)} 条')
+
+prompt_prefix = 'Refer to the following text to describe the specific information of the corresponding image: '
+
+for i in tqdm(range(0, len(my_list), BATCH_SIZE)):
+    batch = my_list[i:i+BATCH_SIZE]
+    prompts = [f'{prompt_prefix}"{item["text"]}"' for item in batch]
     
-    def __getitem__(self, idx):
-        prompt = 'Refer to the following text to describe the specific information of the corresponding image: '
-        caption = self.json_contents[idx]['text']
-        img_dir = self.json_contents[idx]['image']
-        caption = f'{prompt}"{caption}"'
-        return caption, img_dir
-
-def write_to_json(file_path, data):
-    with open(file_path, 'a') as f:
-        json.dump(data, f)
-        f.write('\n') 
-
-def main():
-    local_rank, world_size = parse()
-    setup_distributed(local_rank, world_size)
-
-    model_path = '' # pick your own model
-    model = load_model(model_path, local_rank)
-    print(f"Model loaded on rank {local_rank}")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-
-    json_file = 'unprocessed_train.json'
-    root_dir = '../data/rshaojimmy/'
-    test = 'Caption_Prompt/test.json'
-
-    dataset = CaptionIterableDataset(json_file, root_dir, tokenizer)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank)
-    dataloader = DataLoader(dataset, batch_size=1, num_workers=0, sampler=sampler)
-
-    gen_kwargs = {"max_length": 120, "do_sample": True, "top_k": 1}
-    temp_file = f'temp/llm_{local_rank}.json'
-    with open(temp_file, 'w') as f:
-        f.write('[')
-    for batch in tqdm(dataloader):
-        query, img_dir = batch
-        inputs = tokenizer.apply_chat_template(
-            [{"role": "user", "content": query}],
-            add_generation_prompt=True,
-            tokenize=True,
-            return_tensors="pt",
-            return_dict=True
-        )
-        inputs = inputs.to(f'cuda:{local_rank}')
-        result = {}
+    try:
+        messages_batch = [[{"role": "user", "content": p}] for p in prompts]
+        texts = [tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in messages_batch]
+        inputs = tokenizer(texts, return_tensors='pt', padding=True, truncation=True, max_length=512).to(device)
+        
         with torch.no_grad():
-            outputs = model.module.generate(**inputs, **gen_kwargs)
-            outputs = outputs[:, inputs['input_ids'].shape[1]:]
-            answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            result[img_dir[0]] = answer
-            with open(temp_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(result, ensure_ascii=False) + ',\n')
-    with open(temp_file, 'a') as f:
-        f.write(']')
-if __name__ == '__main__':
-    main()
+            outputs = model.generate(**inputs, max_new_tokens=60, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+        
+        for j, item in enumerate(batch):
+            input_len = inputs['input_ids'].shape[1]
+            answer = tokenizer.decode(outputs[j][input_len:], skip_special_tokens=True)
+            results[item['image']] = answer
+    except Exception as e:
+        print(f'Error: {e}')
+        for item in batch:
+            results[item['image']] = ''
+
+    if (i // BATCH_SIZE + 1) % 100 == 0:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=True)
+
+with open(output_file, 'w', encoding='utf-8') as f:
+    json.dump(results, f, ensure_ascii=True)
+print(f'GPU{gpu_id} 完成，共 {len(results)} 条')

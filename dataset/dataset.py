@@ -21,7 +21,7 @@ from random import random as rand
 class DGM4_Dataset(Dataset):
     def __init__(self, config, ann_file, transform, max_words=30, is_train=True): 
         
-        self.root_dir = '../data/rshaojimmy'       
+        self.root_dir = '/nas/data_2/wanhongz/datasets'     
         self.ann = []
         for f in ann_file:
             self.ann += json.load(open(f,'r'))
@@ -192,4 +192,4 @@ class DGM4_Dataset(Dataset):
         real_prom = self.text_prompt.get(img_dir, real_prom_mistral)
         real_prom = pre_caption(real_prom, self.max_words)
                 
-        return image, label, caption, fake_image_box, fake_text_pos_list, W, H, real_cap, real_prom, res_fake_pos, res_fake_pos_patch
+        return image, label, caption, fake_image_box, fake_text_pos_list, W, H, real_cap, real_prom, res_fake_pos, res_fake_pos_patch, img_dir

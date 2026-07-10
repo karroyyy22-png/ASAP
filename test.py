@@ -5,7 +5,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
-import ruamel_yaml as yaml
+import ruamel.yaml as yaml
 import numpy as np
 import random
 import time
@@ -44,6 +44,48 @@ from models import box_ops
 from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 
 from models.ASAP import ASAP
+
+# ========== OmniFD 分数级融合相关配置 ==========
+OMNI_SCORE_PATH = '/nas/data_2/wanhongz/face_cropped_features/score_full.npy'
+OMNI_META_PATH = '/nas/data_2/wanhongz/face_cropped_features/meta_full.json'
+OMNI_ALPHA = 0.5  # 融合权重：final = alpha*ASAP + (1-alpha)*OmniFD
+
+def load_omni_lookup():
+    """加载 OmniFD 的 path->score 查找表"""
+    if not (os.path.exists(OMNI_SCORE_PATH) and os.path.exists(OMNI_META_PATH)):
+        print(f"[WARNING] 未找到OmniFD分数文件，跳过融合，仅使用原始ASAP结果")
+        return {}
+    scores = np.load(OMNI_SCORE_PATH)
+    meta = json.load(open(OMNI_META_PATH))
+    paths = meta['paths']
+    lookup = dict(zip(paths, scores))
+    print(f"[OmniFD] 加载了 {len(lookup)} 条人脸伪造分数")
+    return lookup
+
+
+OMNI_FEAT_512_DIR = '/nas/data_2/wanhongz/ASAP'
+
+def load_omni_feats_512(split):
+    """加载指定split的OmniFD 512维特征查找表 (img_dir -> 512维tensor)，用于特征级融合"""
+    path = f'{OMNI_FEAT_512_DIR}/omnifd_{split}_feats.pt'
+    feats = torch.load(path, map_location='cpu')
+    print(f'[Omni Fusion] loaded {len(feats)} feature entries from {path}')
+    return feats
+
+def build_omni_batch(img_dirs, omni_feats, device):
+    """按img_dir列表查表拼成batch tensor，查不到的用全零占位"""
+    vecs = []
+    for d in img_dirs:
+        if d in omni_feats:
+            vecs.append(omni_feats[d])
+        else:
+            vecs.append(torch.zeros(512, dtype=torch.float32))
+    return torch.stack(vecs, dim=0).to(device, non_blocking=True)
+
+def is_face_related(label):
+    """判断该样本标签是否属于人脸相关类别（含混合类别），只对这些类别做融合"""
+    return ('face_swap' in label) or ('face_attribute' in label)
+
 
 def setlogger(log_file):
     filehandler = logging.FileHandler(log_file)
@@ -103,10 +145,48 @@ def text_input_adjust(text_input, fake_word_pos, device, cap=False):
 
     return text_input, fake_token_pos_batch, subword_idx_rm_CLSSEP_batch
 
-  
+
+def compute_per_category(label_all, y_true_np, y_pred_np, pred_acc_np, IOU_pred_all, categories):
+    """给定 y_pred / pred_acc，计算每个类别的 ACC/F1/IoU（AUC按原逻辑保留，不做修复，仅供参考）"""
+    per_cat_results = {}
+    for cat in categories:
+        idx = np.where(label_all == cat)[0]
+        if len(idx) == 0:
+            continue
+        y_t = y_true_np[idx]
+        y_p = y_pred_np[idx]
+        p_acc = pred_acc_np[idx]
+        ACC = np.mean(p_acc == y_t)
+        if len(np.unique(y_t)) >= 2:
+            AUC = roc_auc_score(y_t, y_p)
+        else:
+            AUC = float('nan')
+        TP = np.sum((y_t == 1) & (p_acc == 1))
+        FP = np.sum((y_t == 0) & (p_acc == 1))
+        FN = np.sum((y_t == 1) & (p_acc == 0))
+        P = TP / (TP + FP) if (TP + FP) > 0 else 0
+        R = TP / (TP + FN) if (TP + FN) > 0 else 0
+        F1 = 2 * P * R / (P + R) if (P + R) > 0 else 0
+
+        IOU_cat = IOU_pred_all[idx]
+        IOU_mean = np.mean(IOU_cat)
+        IOU_50 = np.mean(IOU_cat > 0.5)
+        IOU_75 = np.mean(IOU_cat > 0.75)
+
+        per_cat_results[cat] = {
+            'N': len(idx),
+            'AUC': AUC,
+            'ACC': ACC,
+            'F1': F1,
+            'IoU': IOU_mean,
+            'IoU@50': IOU_50,
+            'IoU@75': IOU_75
+        }
+    return per_cat_results
+
 
 @torch.no_grad()
-def evaluation(args, model, data_loader, tokenizer, device, config):
+def evaluation(args, model, data_loader, tokenizer, device, config, omni_lookup, omni_test_feats_512):
     # test
     model.eval() 
     
@@ -114,115 +194,69 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     header = 'Evaluation:'    
     
     print('Computing features for evaluation...')
+    start_time = time.time()   
     print_freq = 200 
 
-    y_true, y_pred, IOU_pred, IOU_50, IOU_75, IOU_95 = [], [], [], [], [], []
-    cls_nums_all = 0
-    cls_acc_all = 0  
-    cls_image_all = 0
-    cls_all = 0 
+    y_true, y_pred = [], []
+    IOU_pred_all = []
+    label_all = []
+    pred_acc_all = []
+    img_path_all = []
 
-    TP_all = 0
-    TN_all = 0
-    FP_all = 0
-    FN_all = 0
-    
-    TP_all_multicls = np.zeros(4, dtype = int)
-    TN_all_multicls = np.zeros(4, dtype = int)
-    FP_all_multicls = np.zeros(4, dtype = int)
-    FN_all_multicls = np.zeros(4, dtype = int)
-    F1_multicls = np.zeros(4)
+    cls_nums_all = 0
+    cls_acc_all = 0   
 
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
 
-    for i, (image, label, text, fake_image_box, fake_word_pos, W, H, real_cap,real_prom,res_fake_pos,res_fake_pos_patch) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
-        
-        image = image.to(device,non_blocking=True) 
+    for i, (image, label, text, fake_image_box, fake_word_pos, W, H, real_cap, real_prom, res_fake_pos, res_fake_pos_patch, img_path) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
+        image = image.to(device, non_blocking=True) 
         
         text_input = tokenizer(text, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False) 
         cap_input = tokenizer(real_cap, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False) 
-        prom_input = tokenizer(real_prom, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False)
+        prom_input = tokenizer(real_prom, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False) 
 
         text_input, fake_token_pos, _ = text_input_adjust(text_input, fake_word_pos, device)
-        cap_input  = text_input_adjust(cap_input, fake_word_pos, device, True)
+        cap_input = text_input_adjust(cap_input, fake_word_pos, device, True)
         prom_input = text_input_adjust(prom_input, fake_word_pos, device, True)
 
-        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch,is_train=False)
+        if args.use_omni_fusion:
+            omni_feat_batch = build_omni_batch(img_path, omni_test_feats_512, device)
+        else:
+            omni_feat_batch = None
+        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch, is_train=False, omni_feat=omni_feat_batch)
 
         ##================= real/fake cls ========================## 
         cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
         real_label_pos = np.where(np.array(label) == 'orig')[0].tolist()
-        #=======================
-        # image_cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
-        # real_image_pos = []
-        # orig = np.where(np.array(label)=='orig')[0].tolist()
-        # text_swrap_only = np.where(np.array(label) == 'text_swap')[0].tolist()
-        # text_attr_only = np.where(np.array(label) == 'text_attribute')[0].tolist()
-        # real_image_pos.extend(orig)
-        # real_image_pos.extend(text_swrap_only)
-        # real_image_pos.extend(text_attr_only)
-        # image_cls_label[real_image_pos] = 0
-
-        # text_cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
-        # real_text_pos = []
-        # face_swrap_only = np.where(np.array(label) == 'face_swap')[0].tolist()
-        # face_attr_only = np.where(np.array(label) == 'face_attribute')[0].tolist()
-        # real_text_pos.extend(orig)
-        # real_text_pos.extend(face_swrap_only)
-        # real_text_pos.extend(face_attr_only)
-        # text_cls_label[real_text_pos] = 0
-
-        # pred_image_acc = images_logits_real.argmax(1)
-        # cls_image_all += torch.sum(pred_image_acc == image_cls_label).item()
-        #=======================
         cls_label[real_label_pos] = 0
-
-        y_pred.extend(F.softmax(logits_real_fake,dim=1)[:,1].cpu().flatten().tolist())
+        
+        prob_fake = F.softmax(logits_real_fake, dim=1)[:, 1]
+        y_pred.extend(prob_fake.cpu().flatten().tolist())
         y_true.extend(cls_label.cpu().flatten().tolist())
 
         pred_acc = logits_real_fake.argmax(1)
         cls_nums_all += cls_label.shape[0]
         cls_acc_all += torch.sum(pred_acc == cls_label).item()
-        # cls_all += torch.sum((pred_acc == cls_label)|(pred_image_acc == image_cls_label)).item()
-  
+        
+        label_all.extend(label)
+        pred_acc_all.extend(pred_acc.cpu().tolist())
+        img_path_all.extend(img_path)
+        
         # ----- multi metrics -----
         target, _ = get_multi_label(label, image)
         multi_label_meter.add(logits_multicls, target)
         
-        for cls_idx in range(logits_multicls.shape[1]):
-            cls_pred = logits_multicls[:, cls_idx]
-            cls_pred[cls_pred>=0]=1
-            cls_pred[cls_pred<0]=0
-            
-            TP_all_multicls[cls_idx] += torch.sum((target[:, cls_idx] == 1) * (cls_pred == 1)).item()
-            TN_all_multicls[cls_idx] += torch.sum((target[:, cls_idx] == 0) * (cls_pred == 0)).item()
-            FP_all_multicls[cls_idx] += torch.sum((target[:, cls_idx] == 0) * (cls_pred == 1)).item()
-            FN_all_multicls[cls_idx] += torch.sum((target[:, cls_idx] == 1) * (cls_pred == 0)).item()
-            
-        # ##================= bbox cls ========================## 
+        ##================= bbox cls ========================## 
         boxes1 = box_ops.box_cxcywh_to_xyxy(output_coord)
         boxes2 = box_ops.box_cxcywh_to_xyxy(fake_image_box)
 
         IOU, _ = box_ops.box_iou(boxes1, boxes2.to(device), test=True)
-
-        IOU_pred.extend(IOU.cpu().tolist())
-
-        IOU_50_bt = torch.zeros(IOU.shape, dtype=torch.long)
-        IOU_75_bt = torch.zeros(IOU.shape, dtype=torch.long)
-        IOU_95_bt = torch.zeros(IOU.shape, dtype=torch.long)
-
-        IOU_50_bt[IOU>0.5] = 1
-        IOU_75_bt[IOU>0.75] = 1
-        IOU_95_bt[IOU>0.95] = 1
-
-        IOU_50.extend(IOU_50_bt.cpu().tolist())
-        IOU_75.extend(IOU_75_bt.cpu().tolist())
-        IOU_95.extend(IOU_95_bt.cpu().tolist())
+        IOU_pred_all.extend(IOU.cpu().tolist())
 
         ##================= token cls ========================##  
-        token_label = text_input.attention_mask[:,1:].clone() # [:,1:] for ingoring class token
-        token_label[token_label==0] = -100 # -100 index = padding token
+        token_label = text_input.attention_mask[:,1:].clone()
+        token_label[token_label==0] = -100
         token_label[token_label==1] = 0
 
         for batch_idx in range(len(fake_token_pos)):
@@ -230,51 +264,171 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
             if fake_pos_sample:
                 for pos in fake_pos_sample:
                     token_label[batch_idx, pos] = 1
-                    
+
         logits_tok_reshape = logits_tok.view(-1, 2)
         logits_tok_pred = logits_tok_reshape.argmax(1)
         token_label_reshape = token_label.view(-1)
 
-        # F1
-        TP_all += torch.sum((token_label_reshape == 1) * (logits_tok_pred == 1)).item()
-        TN_all += torch.sum((token_label_reshape == 0) * (logits_tok_pred == 0)).item()
-        FP_all += torch.sum((token_label_reshape == 0) * (logits_tok_pred == 1)).item()
-        FN_all += torch.sum((token_label_reshape == 1) * (logits_tok_pred == 0)).item()
-                 
-    ##================= real/fake cls ========================## 
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    AUC_cls = roc_auc_score(y_true, y_pred)
-    ACC_cls = cls_acc_all / cls_nums_all
-    fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
-    EER_cls = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+        if i == 0:
+            TP_all = torch.sum((token_label_reshape == 1) * (logits_tok_pred == 1)).item()
+            TN_all = torch.sum((token_label_reshape == 0) * (logits_tok_pred == 0)).item()
+            FP_all = torch.sum((token_label_reshape == 0) * (logits_tok_pred == 1)).item()
+            FN_all = torch.sum((token_label_reshape == 1) * (logits_tok_pred == 0)).item()
+        else:
+            TP_all += torch.sum((token_label_reshape == 1) * (logits_tok_pred == 1)).item()
+            TN_all += torch.sum((token_label_reshape == 0) * (logits_tok_pred == 0)).item()
+            FP_all += torch.sum((token_label_reshape == 0) * (logits_tok_pred == 1)).item()
+            FN_all += torch.sum((token_label_reshape == 1) * (logits_tok_pred == 0)).item()
 
-    # ACC_image = cls_image_all / cls_nums_all
-    # ACC_all = cls_all / cls_nums_all
-    # print(f'图片判断正确率： {ACC_image}')
-    # print(f'判断正确率： {ACC_all}')
-    ##================= bbox cls ========================##
-    IOU_score = sum(IOU_pred)/len(IOU_pred)
-    IOU_ACC_50 = sum(IOU_50)/len(IOU_50)
-    IOU_ACC_75 = sum(IOU_75)/len(IOU_75)
-    IOU_ACC_95 = sum(IOU_95)/len(IOU_95)
-    # ##================= token cls========================##
-    ACC_tok = (TP_all + TN_all) / (TP_all + TN_all + FP_all + FN_all)
-    Precision_tok = TP_all / (TP_all + FP_all)
-    Recall_tok = TP_all / (TP_all + FN_all)
-    F1_tok = 2*Precision_tok*Recall_tok / (Precision_tok + Recall_tok)
-    ##================= multi-label cls ========================## 
+    ##================= 转成numpy，准备融合 ========================##
+    y_true_np = np.array(y_true)
+    y_pred_np = np.array(y_pred)
+    pred_acc_np = np.array(pred_acc_all)
+    label_all_np = np.array(label_all)
+    IOU_pred_all_np = np.array(IOU_pred_all)
+
+    ##================= 融合前指标（baseline） ========================##
+    AUC_cls_orig = roc_auc_score(y_true_np, y_pred_np)
+    ACC_cls_orig = cls_acc_all / cls_nums_all
+    fpr, tpr, _ = roc_curve(y_true_np, y_pred_np, pos_label=1)
+    EER_cls_orig = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+
+    ##================= OmniFD 融合 ========================##
+    n = len(img_path_all)
+    omni_scores = np.zeros(n)
+    omni_valid = np.zeros(n, dtype=bool)
+
+    for idx in range(n):
+        path = img_path_all[idx]
+        lbl = label_all[idx]
+        if path in omni_lookup and is_face_related(lbl):
+            omni_scores[idx] = omni_lookup[path]
+            omni_valid[idx] = True
+
+    n_fused = omni_valid.sum()
+    print(f"[OmniFD融合] 共 {n} 张测试图，其中 {n_fused} 张(人脸相关类别且查到分数)参与融合")
+
+    # 保存原始逐样本数据，供后续诊断分析和alpha搜索使用（避免重复跑模型推理）
+    np.savez(os.path.join(args.output_dir, args.log_num, 'evaluation', 'raw_eval_data.npz'),
+             y_true=y_true_np, y_pred_asap=y_pred_np, omni_scores=omni_scores,
+             omni_valid=omni_valid, label_all=label_all_np,
+             img_path_all=np.array(img_path_all, dtype=object))
+    print("原始逐样本数据已保存")
+
+    # ========== 诊断：ASAP判断错误时，OmniFD的判断是否正确 ==========
+    asap_pred_binary = (y_pred_np >= 0.5).astype(np.int64)
+    asap_wrong = (asap_pred_binary != y_true_np) & omni_valid
+    n_asap_wrong = asap_wrong.sum()
+    if n_asap_wrong > 0:
+        omni_pred_binary = (omni_scores >= 0.5).astype(np.int64)
+        omni_correct_where_asap_wrong = (omni_pred_binary == y_true_np)[asap_wrong]
+        ratio = omni_correct_where_asap_wrong.mean()
+        print(f"\n[诊断] ASAP判断错误且有OmniFD分数的样本数: {n_asap_wrong}")
+        print(f"[诊断] 其中OmniFD判断正确的比例: {ratio:.4f}")
+    else:
+        print("\n[诊断] 没有找到ASAP判断错误且有OmniFD分数的样本")
+
+    y_pred_fused = y_pred_np.copy()
+    y_pred_fused[omni_valid] = OMNI_ALPHA * y_pred_np[omni_valid] + (1 - OMNI_ALPHA) * omni_scores[omni_valid]
+
+    pred_acc_fused = (y_pred_fused >= 0.5).astype(np.int64)
+
+    ##================= 融合后指标 ========================##
+    AUC_cls_fused = roc_auc_score(y_true_np, y_pred_fused)
+    ACC_cls_fused = np.mean(pred_acc_fused == y_true_np)
+    fpr_f, tpr_f, _ = roc_curve(y_true_np, y_pred_fused, pos_label=1)
+    EER_cls_fused = brentq(lambda x: 1. - x - interp1d(fpr_f, tpr_f)(x), 0., 1.)
+
+    ##================= multi-label cls (不受OmniFD融合影响，按原逻辑) ========================## 
     MAP = multi_label_meter.value().mean()
     OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
-            
-    for cls_idx in range(logits_multicls.shape[1]):
-        Precision_multicls = TP_all_multicls[cls_idx] / (TP_all_multicls[cls_idx] + FP_all_multicls[cls_idx])
-        Recall_multicls = TP_all_multicls[cls_idx] / (TP_all_multicls[cls_idx] + FN_all_multicls[cls_idx])
-        F1_multicls[cls_idx] = 2*Precision_multicls*Recall_multicls / (Precision_multicls + Recall_multicls)            
+    OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k = multi_label_meter.overall_topk(3)
+    
+    ##================= bbox cls (不受OmniFD融合影响) ========================##
+    IOU_score = np.mean(IOU_pred_all_np)
+    IOU_ACC_50 = np.mean(IOU_pred_all_np > 0.5)
+    IOU_ACC_75 = np.mean(IOU_pred_all_np > 0.75)
+    IOU_ACC_95 = np.mean(IOU_pred_all_np > 0.95)
 
-    return AUC_cls, ACC_cls, EER_cls, \
-        MAP.item(), OP, OR, OF1, CP, CR, CF1, F1_multicls, \
-        IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
-        ACC_tok, Precision_tok, Recall_tok, F1_tok
+    ##================= token cls ========================##
+    ACC_tok = (TP_all + TN_all) / (TP_all + TN_all + FP_all + FN_all)
+    Precision_tok = TP_all / (TP_all + FP_all) if (TP_all + FP_all) > 0 else 0
+    Recall_tok = TP_all / (TP_all + FN_all) if (TP_all + FN_all) > 0 else 0
+    F1_tok = 2 * Precision_tok * Recall_tok / (Precision_tok + Recall_tok) if (Precision_tok + Recall_tok) > 0 else 0
+
+    # ================== 按操纵类别统计（融合前 vs 融合后）==================
+    save_dir = os.path.join(args.output_dir, args.log_num, 'evaluation')
+    os.makedirs(save_dir, exist_ok=True)
+
+    categories = ['orig', 'face_swap', 'face_attribute', 'text_swap', 'text_attribute',
+                  'face_swap&text_swap', 'face_swap&text_attribute',
+                  'face_attribute&text_swap', 'face_attribute&text_attribute']
+
+    per_cat_results_orig = compute_per_category(label_all_np, y_true_np, y_pred_np, pred_acc_np, IOU_pred_all_np, categories)
+    per_cat_results_fused = compute_per_category(label_all_np, y_true_np, y_pred_fused, pred_acc_fused, IOU_pred_all_np, categories)
+
+    print("\n===== Per-Category Results (融合后, Fused) =====")
+    for cat, res in per_cat_results_fused.items():
+        print(f"\n[{cat}] N={res['N']}")
+        print(f"  AUC={res['AUC']:.4f}, ACC={res['ACC']:.4f}, F1={res['F1']:.4f}")
+        print(f"  IoU={res['IoU']:.4f}, IoU@50={res['IoU@50']:.4f}, IoU@75={res['IoU@75']:.4f}")
+
+    # results_per_category.json 保存融合后的最终结果（这是主要交付物）
+    with open(os.path.join(save_dir, 'results_per_category.json'), 'w') as f:
+        json.dump(per_cat_results_fused, f, indent=2)
+    print(f"\nPer-category results (fused) saved to {save_dir}/results_per_category.json")
+
+    # 计算 F1_multicls（复用per_cat_results的F1，与原代码逻辑一致）
+    cat_names = ['face_swap', 'face_attribute', 'text_swap', 'text_attribute']
+
+    F1_multicls_orig = np.zeros(4)
+    F1_multicls_fused = np.zeros(4)
+    for cls_idx, cat in enumerate(cat_names):
+        if cat in per_cat_results_orig:
+            F1_multicls_orig[cls_idx] = per_cat_results_orig[cat]['F1']
+        if cat in per_cat_results_fused:
+            F1_multicls_fused[cls_idx] = per_cat_results_fused[cat]['F1']
+
+    # ================== 写 results_all.txt：融合前 vs 融合后 对比 ==================
+    lines = []
+    lines.append("="*70)
+    lines.append("OmniFD 融合前后指标对比 (alpha=%.2f)" % OMNI_ALPHA)
+    lines.append(f"参与融合样本数: {n_fused} / {n} (仅face_swap/face_attribute及其混合类别)")
+    lines.append("="*70)
+
+    def fmt_line(name, before, after):
+        delta = after - before
+        sign = '+' if delta >= 0 else ''
+        return f"{name:20s}  Before={before*100:8.4f}  After={after*100:8.4f}  Delta={sign}{delta*100:.4f}"
+
+    lines.append(fmt_line("AUC_cls", AUC_cls_orig, AUC_cls_fused))
+    lines.append(fmt_line("ACC_cls", ACC_cls_orig, ACC_cls_fused))
+    lines.append(fmt_line("EER_cls", EER_cls_orig, EER_cls_fused))
+    lines.append(fmt_line("F1_FS", F1_multicls_orig[0], F1_multicls_fused[0]))
+    lines.append(fmt_line("F1_FA", F1_multicls_orig[1], F1_multicls_fused[1]))
+    lines.append(fmt_line("F1_TS", F1_multicls_orig[2], F1_multicls_fused[2]))
+    lines.append(fmt_line("F1_TA", F1_multicls_orig[3], F1_multicls_fused[3]))
+    lines.append("-"*70)
+    lines.append("以下指标不受OmniFD融合影响（记录作为参照）：")
+    lines.append(f"IOU_score            = {IOU_score*100:.4f}")
+    lines.append(f"IOU_ACC_50            = {IOU_ACC_50*100:.4f}")
+    lines.append(f"IOU_ACC_75            = {IOU_ACC_75*100:.4f}")
+    lines.append(f"IOU_ACC_95            = {IOU_ACC_95*100:.4f}")
+    lines.append(f"MAP                   = {MAP.item()*100:.4f}")
+    lines.append(f"OF1 / CF1             = {OF1*100:.4f} / {CF1*100:.4f}")
+    lines.append(f"ACC_tok / F1_tok      = {ACC_tok*100:.4f} / {F1_tok*100:.4f}")
+    lines.append("="*70)
+
+    result_all_path = os.path.join(save_dir, 'results_all.txt')
+    with open(result_all_path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f"\n融合前后对比已保存到 {result_all_path}")
+    print('\n'.join(lines))
+
+    return AUC_cls_fused, ACC_cls_fused, EER_cls_fused, \
+           MAP.item(), OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, F1_multicls_fused, \
+           IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
+           ACC_tok, Precision_tok, Recall_tok, F1_tok
     
 def main_worker(gpu, args, config):
 
@@ -308,12 +462,15 @@ def main_worker(gpu, args, config):
     random.seed(seed)
     cudnn.benchmark = True
 
+    # 加载OmniFD分数查找表
+    omni_lookup = load_omni_lookup()
+    omni_test_feats_512 = load_omni_feats_512('test')
 
     #### Model #### 
-    tokenizer = BertTokenizerFast.from_pretrained('../data/bert-base-uncased')
+    tokenizer = BertTokenizerFast.from_pretrained('/nas/data_2/wanhongz/bert-base-uncased')
     if args.log:
         print(f"Creating Model")
-    model = ASAP(args=args, config=config, text_encoder='../data/bert-base-uncased', tokenizer=tokenizer, init_deit=True)
+    model = ASAP(args=args, config=config, text_encoder='/nas/data_2/wanhongz/bert-base-uncased', tokenizer=tokenizer, init_deit=True)
     
     model = model.to(device)   
 
@@ -325,7 +482,6 @@ def main_worker(gpu, args, config):
     pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'],model.visual_encoder)   
     state_dict['visual_encoder.pos_embed'] = pos_embed_reshaped       
                    
-    # model.load_state_dict(state_dict)  
     if args.log:
         print('load checkpoint from %s'%checkpoint_dir)  
     msg = model.load_state_dict(state_dict, strict=False)
@@ -359,9 +515,9 @@ def main_worker(gpu, args, config):
         print("Start evaluation")
 
     AUC_cls, ACC_cls, EER_cls, \
-    MAP, OP, OR, OF1, CP, CR, CF1, F1_multicls, \
+    MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, F1_multicls, \
     IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
-    ACC_tok, Precision_tok, Recall_tok, F1_tok  = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
+    ACC_tok, Precision_tok, Recall_tok, F1_tok  = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config, omni_lookup, omni_test_feats_512)
     #============ evaluation info ============#
     val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
                     "ACC_cls": "{:.4f}".format(ACC_cls*100),
@@ -398,14 +554,13 @@ def main_worker(gpu, args, config):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='./configs/Pretrain.yaml')
-    parser.add_argument('--checkpoint', default='') 
+    parser.add_argument('--checkpoint', default='')
+    parser.add_argument('--use_omni_fusion', action='store_true', help='是否启用OmniFD特征融合，不加此参数则跑纯净ASAP基线') 
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='/mnt/lustre/share/rshao/data/FakeNews/Ours/results')
     parser.add_argument('--text_encoder', default='bert-base-uncased')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=777, type=int)
-    # parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')    
-    # parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=False, type=bool)
     parser.add_argument('--rank', default=-1, type=int,
                         help='node rank for distributed training')

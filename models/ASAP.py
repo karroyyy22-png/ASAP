@@ -1,6 +1,8 @@
 from functools import partial
 from models.vit import VisionTransformer, interpolate_pos_embed
 from models.xbert import BertConfig, BertForMaskedLM, BertForTokenClassification
+import torch.nn.functional as F
+import timm 
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +27,24 @@ class Multilmodelattention(nn.Module):
         x, _ = self.crossatten(x, key, value, key_padding_mask=key_padding_mask)
         x = x + query
         return x
+
+# 添加篡改检测器类
+# class TamperDetector(nn.Module):
+#     def __init__(self):
+#         super().__init__()
+#         self.backbone = timm.create_model(
+#             'efficientnet_b0', pretrained=True, num_classes=0
+#         )
+#         self.fc = nn.Linear(1280, 1)
+#         self.dropout = nn.Dropout(0.3)
     
+#     def forward(self, image):
+#         x = F.interpolate(image, size=(224,224), mode='bilinear', align_corners=False)
+#         feat = self.backbone(x)
+#         feat = self.dropout(feat)
+#         s = torch.sigmoid(self.fc(feat)).squeeze(-1)
+#         return s  
+
 class ASAP(nn.Module):
     def __init__(self, 
                  args = None, 
@@ -53,6 +72,8 @@ class ASAP(nn.Module):
                                                                     label_smoothing=config['label_smoothing'])      
 
         text_width = self.text_encoder.config.hidden_size
+        self.omni_proj = nn.Linear(512, text_width)       # OmniFD 512维特征投影对齐维度
+        self.omni_fusion_fc = nn.Linear(text_width * 2, text_width)  # 拼接后压缩回原维度
         self.vision_proj = nn.Linear(vision_width, embed_dim)
         self.text_proj = nn.Linear(text_width, embed_dim)         
 
@@ -106,7 +127,12 @@ class ASAP(nn.Module):
 
         self.norm_layer_it_cross_atten =nn.LayerNorm(text_width)
         self.it_cross_attn = Multilmodelattention(text_width, 12)
-        self.UtilsC = nn.Parameter(torch.tensor(0.5))
+        # self.UtilsC = nn.Parameter(torch.tensor(0.5))
+
+        # 临时占位：先用常数0.5，后面替换成真正的模型
+        # self.fake_s = 0.5
+        #        self.tamper_detector = TamperDetector()
+
         self.UtilsB = nn.Parameter(torch.tensor(0.5))
 
         trunc_normal_(self.cls_token_local, std=.02)
@@ -174,7 +200,10 @@ class ASAP(nn.Module):
 
         loss = criterion(pre_patch, gt_patch)
         return loss
-    def forward(self, image, label, text, fake_image_box, fake_text_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch, alpha=0, is_train=True):
+    def forward(self, image, label, text, fake_image_box, fake_text_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch, alpha=0, is_train=True, omni_feat=None):
+        
+        # 计算篡改置信度 s（目前用占位符0.5）
+        # s = self.tamper_detector(image)   # [B]
         if is_train:
             with torch.no_grad():
                 self.temp.clamp_(0.001,0.5)
@@ -326,6 +355,11 @@ class ASAP(nn.Module):
             
             output_coord = self.bbox_head(local_feat_aggr.squeeze(1)).sigmoid()
             loss_bbox, loss_giou = self.get_bbox_loss(output_coord, fake_image_box)
+            ##================= Omni feature fusion ========================##
+            vision_feat = local_feat_aggr.squeeze(1)
+            if omni_feat is not None:
+                omni_feat_proj = self.omni_proj(omni_feat)
+                vision_feat = self.omni_fusion_fc(torch.cat([vision_feat, omni_feat_proj], dim=-1))
             ##================= BIC ========================## 
             # forward the positve image-text pair
             output_pos = self.text_encoder.bert(encoder_embeds = text_embeds, 
@@ -347,7 +381,7 @@ class ASAP(nn.Module):
 
             itm_labels = torch.ones(bs, dtype=torch.long).to(image.device)
             itm_labels[real_label_pos] = 0 # fine-grained matching: only orig should be matched, 0 here means img-text matching
-            vl_output = self.itm_head(output_pos.last_hidden_state[:,0,:] + self.UtilsB * local_feat_aggr.squeeze(1))   
+            vl_output = self.itm_head(output_pos.last_hidden_state[:,0,:] + self.UtilsB * vision_feat)   
             loss_BIC = F.cross_entropy(vl_output, itm_labels) 
             ##================= BIC_m For Explanation text training ========================## 
             cls_tokens_local_m = self.cls_token_local.expand(bs, -1, -1)
@@ -374,7 +408,12 @@ class ASAP(nn.Module):
             loss_IED = F.cross_entropy(vl_output_m, itm_labels_m) 
 
             ##================= MLC ========================## 
-            output_cls = self.cls_head(output_pos.last_hidden_state[:,0,:] + self.UtilsC * local_feat_aggr.squeeze(1))
+            text_feat = output_pos.last_hidden_state[:,0,:]
+
+            # output_cls = self.cls_head(final_feat)
+
+            output_cls = self.cls_head(text_feat + self.UtilsB * vision_feat)
+
             loss_MLC = F.binary_cross_entropy_with_logits(output_cls, multicls_label.type(torch.float))          
             ##================= TMG ========================##    
             token_label = text.attention_mask[:,1:].clone() # [:,1:] for ingoring class token
@@ -453,10 +492,16 @@ class ASAP(nn.Module):
                                               key=self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:]), 
                                               value=self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:]))[0]
             output_coord = self.bbox_head(local_feat_aggr.squeeze(1)).sigmoid()
+            ##================= Omni feature fusion ========================##
+            vision_feat = local_feat_aggr.squeeze(1)
+            if omni_feat is not None:
+                omni_feat_proj = self.omni_proj(omni_feat)
+                vision_feat = self.omni_fusion_fc(torch.cat([vision_feat, omni_feat_proj], dim=-1))
             ##================= BIC ========================## 
-            logits_real_fake = self.itm_head(output_pos.last_hidden_state[:,0,:] + self.UtilsB * local_feat_aggr.squeeze(1))
+            logits_real_fake = self.itm_head(output_pos.last_hidden_state[:,0,:] + self.UtilsB * vision_feat)
             ##================= MLC ========================## 
-            logits_multicls = self.cls_head(output_pos.last_hidden_state[:,0,:] + self.UtilsC * local_feat_aggr.squeeze(1))
+            text_feat = output_pos.last_hidden_state[:,0,:]
+            logits_multicls = self.cls_head(text_feat + self.UtilsB * vision_feat)
             ##================= TMG ========================##   
             input_ids = text.input_ids.clone()
             logits_tok = self.text_encoder(input_ids, 
@@ -495,7 +540,7 @@ class ASAP(nn.Module):
         batch_size = image_feats.shape[0]
 
         ptr = int(self.queue_ptr)
-        assert self.queue_size % batch_size == 0  # for simplicity
+ # assert self.queue_size % batch_size == 0  # for simplicity
 
         # replace the keys at ptr (dequeue and enqueue)
         self.image_queue[:, ptr:ptr + batch_size] = image_feats.T
