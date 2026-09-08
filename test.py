@@ -82,6 +82,34 @@ def build_omni_batch(img_dirs, omni_feats, device):
             vecs.append(torch.zeros(512, dtype=torch.float32))
     return torch.stack(vecs, dim=0).to(device, non_blocking=True)
 
+OMNI_FEAT_LOCAL_DIR = '/nas/data_2/wanhongz/ASAP'
+def load_omni_feats_local(split):
+    """加载指定split的OmniFD局部token特征查找表 (img_dir -> [64,512] tensor)"""
+    feat_path = f'{OMNI_FEAT_LOCAL_DIR}/omnifd_{split}_feats_local.pt'
+    hasface_path = f'{OMNI_FEAT_LOCAL_DIR}/omnifd_{split}_hasface_local.pt'
+    feats = torch.load(feat_path, map_location='cpu')
+    hasface = torch.load(hasface_path, map_location='cpu')
+    print(f'[Omni Fusion Local] loaded {len(feats)} local-token entries from {feat_path}')
+    print(f'[Omni Fusion Local] loaded {len(hasface)} hasface flags from {hasface_path}')
+    return feats, hasface
+
+def build_omni_batch_local(img_dirs, omni_feats, hasface_flags, device):
+    """按img_dir列表查表拼成batch tensor
+    返回: tokens [B,64,512], valid_mask [B,64] (bool, True=有效可参与attention)
+    """
+    vecs, masks = [], []
+    for d in img_dirs:
+        if d in omni_feats:
+            vecs.append(omni_feats[d])
+            is_valid = bool(hasface_flags.get(d, False))
+            masks.append(torch.full((64,), is_valid, dtype=torch.bool))
+        else:
+            vecs.append(torch.zeros(64, 512, dtype=torch.float32))
+            masks.append(torch.zeros(64, dtype=torch.bool))
+    tokens = torch.stack(vecs, dim=0).to(device, non_blocking=True)
+    valid_mask = torch.stack(masks, dim=0).to(device, non_blocking=True)
+    return tokens, valid_mask
+
 def is_face_related(label):
     """判断该样本标签是否属于人脸相关类别（含混合类别），只对这些类别做融合"""
     return ('face_swap' in label) or ('face_attribute' in label)
@@ -186,7 +214,7 @@ def compute_per_category(label_all, y_true_np, y_pred_np, pred_acc_np, IOU_pred_
 
 
 @torch.no_grad()
-def evaluation(args, model, data_loader, tokenizer, device, config, omni_lookup, omni_test_feats_512):
+def evaluation(args, model, data_loader, tokenizer, device, config, omni_lookup, omni_test_feats_512, omni_test_feats_local=None, omni_test_hasface_local=None):
     # test
     model.eval() 
     
@@ -220,11 +248,14 @@ def evaluation(args, model, data_loader, tokenizer, device, config, omni_lookup,
         cap_input = text_input_adjust(cap_input, fake_word_pos, device, True)
         prom_input = text_input_adjust(prom_input, fake_word_pos, device, True)
 
-        if args.use_omni_fusion:
+        omni_valid_mask_batch = None
+        if args.use_omni_fusion_local:
+            omni_feat_batch, omni_valid_mask_batch = build_omni_batch_local(img_path, omni_test_feats_local, omni_test_hasface_local, device)
+        elif args.use_omni_fusion:
             omni_feat_batch = build_omni_batch(img_path, omni_test_feats_512, device)
         else:
             omni_feat_batch = None
-        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch, is_train=False, omni_feat=omni_feat_batch)
+        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch, is_train=False, omni_feat=omni_feat_batch, omni_valid_mask=omni_valid_mask_batch)
 
         ##================= real/fake cls ========================## 
         cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
@@ -367,6 +398,25 @@ def evaluation(args, model, data_loader, tokenizer, device, config, omni_lookup,
     per_cat_results_orig = compute_per_category(label_all_np, y_true_np, y_pred_np, pred_acc_np, IOU_pred_all_np, categories)
     per_cat_results_fused = compute_per_category(label_all_np, y_true_np, y_pred_fused, pred_acc_fused, IOU_pred_all_np, categories)
 
+    # ========== 新增：打印/保存"融合前"（即模型直接输出，已包含omni token序列融合效果，
+    #            但未经过外层OmniFD分数级平均）的真实结果，避免被下面的分数级融合掩盖 ==========
+    print("\n===== Per-Category Results (融合前 / 模型直接输出, Orig) =====")
+    print("(注: 若使用 --use_omni_fusion_local，这里的结果已包含token序列级融合效果；")
+    print(" 若未使用任何omni开关，这里就是纯ASAP基线)")
+    for cat, res in per_cat_results_orig.items():
+        print(f"\n[{cat}] N={res['N']}")
+        print(f"  AUC={res['AUC']:.4f}, ACC={res['ACC']:.4f}, F1={res['F1']:.4f}")
+        print(f"  IoU={res['IoU']:.4f}, IoU@50={res['IoU@50']:.4f}, IoU@75={res['IoU@75']:.4f}")
+
+    with open(os.path.join(save_dir, 'results_per_category_orig.json'), 'w') as f:
+        json.dump(per_cat_results_orig, f, indent=2)
+    print(f"\nPer-category results (orig, 未经分数级融合) saved to {save_dir}/results_per_category_orig.json")
+
+    print("\n===== 整体指标 (融合前 / 模型直接输出, Orig) =====")
+    print(f"AUC_cls_orig = {AUC_cls_orig*100:.4f}")
+    print(f"ACC_cls_orig = {ACC_cls_orig*100:.4f}")
+    print(f"EER_cls_orig = {EER_cls_orig*100:.4f}")
+
     print("\n===== Per-Category Results (融合后, Fused) =====")
     for cat, res in per_cat_results_fused.items():
         print(f"\n[{cat}] N={res['N']}")
@@ -465,6 +515,7 @@ def main_worker(gpu, args, config):
     # 加载OmniFD分数查找表
     omni_lookup = load_omni_lookup()
     omni_test_feats_512 = load_omni_feats_512('test')
+    omni_test_feats_local, omni_test_hasface_local = load_omni_feats_local('test')
 
     #### Model #### 
     tokenizer = BertTokenizerFast.from_pretrained('/nas/data_2/wanhongz/bert-base-uncased')
@@ -517,7 +568,7 @@ def main_worker(gpu, args, config):
     AUC_cls, ACC_cls, EER_cls, \
     MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, F1_multicls, \
     IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
-    ACC_tok, Precision_tok, Recall_tok, F1_tok  = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config, omni_lookup, omni_test_feats_512)
+    ACC_tok, Precision_tok, Recall_tok, F1_tok  = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config, omni_lookup, omni_test_feats_512, omni_test_feats_local, omni_test_hasface_local)
     #============ evaluation info ============#
     val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
                     "ACC_cls": "{:.4f}".format(ACC_cls*100),
@@ -555,7 +606,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='./configs/Pretrain.yaml')
     parser.add_argument('--checkpoint', default='')
-    parser.add_argument('--use_omni_fusion', action='store_true', help='是否启用OmniFD特征融合，不加此参数则跑纯净ASAP基线') 
+    parser.add_argument('--use_omni_fusion', action='store_true', help='是否启用OmniFD特征融合，不加此参数则跑纯净ASAP基线')
+    parser.add_argument('--use_omni_fusion_local', action='store_true', help='是否启用OmniFD局部token序列融合（新方案，与--use_omni_fusion互斥，优先级更高）') 
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='/mnt/lustre/share/rshao/data/FakeNews/Ours/results')
     parser.add_argument('--text_encoder', default='bert-base-uncased')

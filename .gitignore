@@ -35,3 +35,4 @@ explanation_readable.txt
 Prompt_Generate/*.json
 asap_files.txt
 dataset/prompt_engine.json
+.vscode/

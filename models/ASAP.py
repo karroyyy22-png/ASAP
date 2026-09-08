@@ -200,7 +200,7 @@ class ASAP(nn.Module):
 
         loss = criterion(pre_patch, gt_patch)
         return loss
-    def forward(self, image, label, text, fake_image_box, fake_text_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch, alpha=0, is_train=True, omni_feat=None):
+    def forward(self, image, label, text, fake_image_box, fake_text_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch, alpha=0, is_train=True, omni_feat=None, omni_valid_mask=None):
         
         # 计算篡改置信度 s（目前用占位符0.5）
         # s = self.tamper_detector(image)   # [B]
@@ -355,11 +355,31 @@ class ASAP(nn.Module):
             
             output_coord = self.bbox_head(local_feat_aggr.squeeze(1)).sigmoid()
             loss_bbox, loss_giou = self.get_bbox_loss(output_coord, fake_image_box)
-            ##================= Omni feature fusion ========================##
+            ##================= Omni feature fusion (local token, cross-attn) ========================##
             vision_feat = local_feat_aggr.squeeze(1)
             if omni_feat is not None:
-                omni_feat_proj = self.omni_proj(omni_feat)
-                vision_feat = self.omni_fusion_fc(torch.cat([vision_feat, omni_feat_proj], dim=-1))
+                # omni_feat: [B, 64, 512], omni_valid_mask: [B, 64] (True=valid)
+                omni_tokens_proj = self.omni_proj(omni_feat)  # [B, 64, 512] -> [B, 64, text_width]
+
+                existing_kv = self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:])
+                fused_kv = torch.cat([existing_kv, omni_tokens_proj], dim=1)
+
+                existing_len = existing_kv.size(1)
+                bs_ = existing_kv.size(0)
+                existing_mask = torch.zeros(bs_, existing_len, dtype=torch.bool, device=existing_kv.device)
+                if omni_valid_mask is not None:
+                    fused_padding_mask = torch.cat([existing_mask, ~omni_valid_mask], dim=1)
+                else:
+                    omni_mask_default = torch.zeros(bs_, omni_tokens_proj.size(1), dtype=torch.bool, device=existing_kv.device)
+                    fused_padding_mask = torch.cat([existing_mask, omni_mask_default], dim=1)
+
+                local_feat_aggr_omni = self.aggregator(
+                    query=self.norm_layer_aggr(cls_tokens_local),
+                    key=fused_kv,
+                    value=fused_kv,
+                    key_padding_mask=fused_padding_mask
+                )[0]
+                vision_feat = local_feat_aggr_omni.squeeze(1)
             ##================= BIC ========================## 
             # forward the positve image-text pair
             output_pos = self.text_encoder.bert(encoder_embeds = text_embeds, 
@@ -492,11 +512,30 @@ class ASAP(nn.Module):
                                               key=self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:]), 
                                               value=self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:]))[0]
             output_coord = self.bbox_head(local_feat_aggr.squeeze(1)).sigmoid()
-            ##================= Omni feature fusion ========================##
+            ##================= Omni feature fusion (local token, cross-attn) ========================##
             vision_feat = local_feat_aggr.squeeze(1)
             if omni_feat is not None:
-                omni_feat_proj = self.omni_proj(omni_feat)
-                vision_feat = self.omni_fusion_fc(torch.cat([vision_feat, omni_feat_proj], dim=-1))
+                omni_tokens_proj = self.omni_proj(omni_feat)
+
+                existing_kv = self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:])
+                fused_kv = torch.cat([existing_kv, omni_tokens_proj], dim=1)
+
+                existing_len = existing_kv.size(1)
+                bs_ = existing_kv.size(0)
+                existing_mask = torch.zeros(bs_, existing_len, dtype=torch.bool, device=existing_kv.device)
+                if omni_valid_mask is not None:
+                    fused_padding_mask = torch.cat([existing_mask, ~omni_valid_mask], dim=1)
+                else:
+                    omni_mask_default = torch.zeros(bs_, omni_tokens_proj.size(1), dtype=torch.bool, device=existing_kv.device)
+                    fused_padding_mask = torch.cat([existing_mask, omni_mask_default], dim=1)
+
+                local_feat_aggr_omni = self.aggregator(
+                    query=self.norm_layer_aggr(cls_tokens_local),
+                    key=fused_kv,
+                    value=fused_kv,
+                    key_padding_mask=fused_padding_mask
+                )[0]
+                vision_feat = local_feat_aggr_omni.squeeze(1)
             ##================= BIC ========================## 
             logits_real_fake = self.itm_head(output_pos.last_hidden_state[:,0,:] + self.UtilsB * vision_feat)
             ##================= MLC ========================## 

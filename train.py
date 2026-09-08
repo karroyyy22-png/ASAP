@@ -64,6 +64,34 @@ from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 from models.ASAP import ASAP
 from torch.cuda.amp import autocast, GradScaler
 
+OMNI_FEAT_LOCAL_DIR = '/nas/data_2/wanhongz/ASAP'
+def load_omni_feats_local(split):
+    """加载指定split的OmniFD局部token特征查找表 (img_dir -> [64,512] tensor)"""
+    feat_path = f'{OMNI_FEAT_LOCAL_DIR}/omnifd_{split}_feats_local.pt'
+    hasface_path = f'{OMNI_FEAT_LOCAL_DIR}/omnifd_{split}_hasface_local.pt'
+    feats = torch.load(feat_path, map_location='cpu')
+    hasface = torch.load(hasface_path, map_location='cpu')
+    print(f'[Omni Fusion Local] loaded {len(feats)} local-token entries from {feat_path}')
+    print(f'[Omni Fusion Local] loaded {len(hasface)} hasface flags from {hasface_path}')
+    return feats, hasface
+
+def build_omni_batch_local(img_dirs, omni_feats, hasface_flags, device):
+    """按img_dir列表查表拼成batch tensor
+    返回: tokens [B,64,512], valid_mask [B,64] (bool, True=有效可参与attention)
+    """
+    vecs, masks = [], []
+    for d in img_dirs:
+        if d in omni_feats:
+            vecs.append(omni_feats[d])
+            is_valid = bool(hasface_flags.get(d, False))
+            masks.append(torch.full((64,), is_valid, dtype=torch.bool))
+        else:
+            vecs.append(torch.zeros(64, 512, dtype=torch.float32))
+            masks.append(torch.zeros(64, dtype=torch.bool))
+    tokens = torch.stack(vecs, dim=0).to(device, non_blocking=True)
+    valid_mask = torch.stack(masks, dim=0).to(device, non_blocking=True)
+    return tokens, valid_mask
+
 def setlogger(log_file):
     filehandler = logging.FileHandler(log_file)
     streamhandler = logging.StreamHandler()
@@ -119,7 +147,7 @@ def text_input_adjust(text_input, fake_word_pos, device, real_cap=False):
     return text_input, fake_token_pos_batch
 
 
-def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer):
+def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer, omni_train_feats=None, omni_train_feats_local=None, omni_train_hasface_local=None):
     # train
     model.train()  
     
@@ -173,9 +201,13 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         
         # loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC,loss_Patch,loss_image_text_BIC = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos, alpha = alpha)  
         # with autocast():
-        omni_feat_batch = build_omni_batch(img_dir, omni_train_feats, device)
+        omni_valid_mask_batch = None
+        if args.use_omni_fusion_local:
+            omni_feat_batch, omni_valid_mask_batch = build_omni_batch_local(img_dir, omni_train_feats_local, omni_train_hasface_local, device)
+        else:
+            omni_feat_batch = build_omni_batch(img_dir, omni_train_feats, device)
         loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC, lossAnother = model(
-            image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch,alpha=alpha, omni_feat=omni_feat_batch
+            image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch,alpha=alpha, omni_feat=omni_feat_batch, omni_valid_mask=omni_valid_mask_batch
         ) 
         loss = config['loss_MAC_wgt']*loss_MAC \
              + config['loss_BIC_wgt']*loss_BIC \
@@ -235,7 +267,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
 
 
 @torch.no_grad()
-def evaluation(args, model, data_loader, tokenizer, device, config):
+def evaluation(args, model, data_loader, tokenizer, device, config, omni_val_feats=None, omni_val_feats_local=None, omni_val_hasface_local=None):
     # test
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -268,8 +300,12 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         cap_input = text_input_adjust(cap_input, fake_word_pos, device, True)
         prom_input = text_input_adjust(prom_input, fake_word_pos, device, True)
 
-        omni_feat_batch = build_omni_batch(img_dir, omni_val_feats, device)
-        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch,is_train=False, omni_feat=omni_feat_batch)
+        omni_valid_mask_batch = None
+        if args.use_omni_fusion_local:
+            omni_feat_batch, omni_valid_mask_batch = build_omni_batch_local(img_dir, omni_val_feats_local, omni_val_hasface_local, device)
+        else:
+            omni_feat_batch = build_omni_batch(img_dir, omni_val_feats, device)
+        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch,is_train=False, omni_feat=omni_feat_batch, omni_valid_mask=omni_valid_mask_batch)
 
         ##================= real/fake cls ========================## 
         cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
@@ -431,6 +467,11 @@ def main_worker(gpu, args, config):
     global omni_train_feats, omni_val_feats
     omni_train_feats = load_omni_feats('train')
     omni_val_feats = load_omni_feats('val')
+    omni_train_feats_local, omni_train_hasface_local = ({}, {})
+    omni_val_feats_local, omni_val_hasface_local = ({}, {})
+    if args.use_omni_fusion_local:
+        omni_train_feats_local, omni_train_hasface_local = load_omni_feats_local('train')
+        omni_val_feats_local, omni_val_hasface_local = load_omni_feats_local('val')
 
     # ========== Omni特征融合微调：先加载checkpoint，再冻结参数，最后才建optimizer ==========
     if args.checkpoint:    
@@ -451,7 +492,7 @@ def main_worker(gpu, args, config):
         #     print(msg)  
 
     # ========== 冻结除 omni_proj/omni_fusion_fc/cls_head/itm_head 外的所有参数 ==========
-    UNFROZEN_KEYWORDS = ('omni_proj', 'omni_fusion_fc', 'cls_head', 'itm_head')
+    UNFROZEN_KEYWORDS = ('omni_proj', 'aggregator', 'cls_head', 'itm_head')
     n_trainable = 0
     n_frozen = 0
     for name, param in model.named_parameters():
@@ -486,12 +527,12 @@ def main_worker(gpu, args, config):
     start_time = time.time()
 
     for epoch in range(start_epoch, max_epoch):
-        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
+        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer, omni_train_feats, omni_train_feats_local, omni_train_hasface_local) 
         AUC_cls, ACC_cls, EER_cls, \
         MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
         ACC_tok, Precision_tok, Recall_tok, F1_tok \
-        = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
+        = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config, omni_val_feats, omni_val_feats_local, omni_val_hasface_local)
 
         #============ tensorboard train log info ============#
         if args.log:
@@ -619,6 +660,7 @@ if __name__ == '__main__':
     parser.add_argument('--log_num', '-l', type=str)
     parser.add_argument('--model_save_epoch', type=int, default=20)
     parser.add_argument('--token_momentum', default=False, action='store_true')
+    parser.add_argument('--use_omni_fusion_local', action='store_true', help='是否启用OmniFD局部token序列融合（训练时解冻omni_proj+aggregator）')
 
     args = parser.parse_args()
 
