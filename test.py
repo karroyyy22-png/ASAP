@@ -110,6 +110,21 @@ def build_omni_batch_local(img_dirs, omni_feats, hasface_flags, device):
     valid_mask = torch.stack(masks, dim=0).to(device, non_blocking=True)
     return tokens, valid_mask
 
+def build_omni_residual_batch(img_dirs, omni_feats_512, hasface_flags, device):
+    """返回 (omni_feat_global [B,512], face_mask [B] bool)，残差诊断实验用"""
+    vecs, masks = [], []
+    for d in img_dirs:
+        if d in omni_feats_512:
+            vecs.append(omni_feats_512[d])
+            masks.append(bool(hasface_flags.get(d, False)))
+        else:
+            vecs.append(torch.zeros(512, dtype=torch.float32))
+            masks.append(False)
+    feats = torch.stack(vecs, dim=0).to(device, non_blocking=True)
+    face_mask = torch.tensor(masks, dtype=torch.bool, device=device)
+    return feats, face_mask
+
+
 def is_face_related(label):
     """判断该样本标签是否属于人脸相关类别（含混合类别），只对这些类别做融合"""
     return ('face_swap' in label) or ('face_attribute' in label)
@@ -249,13 +264,18 @@ def evaluation(args, model, data_loader, tokenizer, device, config, omni_lookup,
         prom_input = text_input_adjust(prom_input, fake_word_pos, device, True)
 
         omni_valid_mask_batch = None
+        omni_feat_global_batch = None
+        omni_face_mask_batch = None
         if args.use_omni_fusion_local:
             omni_feat_batch, omni_valid_mask_batch = build_omni_batch_local(img_path, omni_test_feats_local, omni_test_hasface_local, device)
+        elif args.use_omni_fusion_residual:
+            omni_feat_batch = None
+            omni_feat_global_batch, omni_face_mask_batch = build_omni_residual_batch(img_path, omni_test_feats_512, omni_test_hasface_local, device)
         elif args.use_omni_fusion:
             omni_feat_batch = build_omni_batch(img_path, omni_test_feats_512, device)
         else:
             omni_feat_batch = None
-        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch, is_train=False, omni_feat=omni_feat_batch, omni_valid_mask=omni_valid_mask_batch)
+        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch, is_train=False, omni_feat=omni_feat_batch, omni_valid_mask=omni_valid_mask_batch, omni_feat_global=omni_feat_global_batch, omni_face_mask=omni_face_mask_batch)
 
         ##================= real/fake cls ========================## 
         cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
@@ -608,6 +628,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', default='')
     parser.add_argument('--use_omni_fusion', action='store_true', help='是否启用OmniFD特征融合，不加此参数则跑纯净ASAP基线')
     parser.add_argument('--use_omni_fusion_local', action='store_true', help='是否启用OmniFD局部token序列融合（新方案，与--use_omni_fusion互斥，优先级更高）') 
+    parser.add_argument('--use_omni_fusion_residual', action='store_true', help='残差加和诊断实验开关，与其他omni开关互斥') 
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='/mnt/lustre/share/rshao/data/FakeNews/Ours/results')
     parser.add_argument('--text_encoder', default='bert-base-uncased')

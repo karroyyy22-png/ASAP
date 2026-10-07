@@ -92,6 +92,43 @@ def build_omni_batch_local(img_dirs, omni_feats, hasface_flags, device):
     valid_mask = torch.stack(masks, dim=0).to(device, non_blocking=True)
     return tokens, valid_mask
 
+def load_omni_hasface(split):
+    """只加载hasface标记（残差诊断实验用，不加载几十GB的局部token特征）"""
+    path = f'{OMNI_FEAT_LOCAL_DIR}/omnifd_{split}_hasface_local.pt'
+    hasface = torch.load(path, map_location='cpu')
+    print(f'[Omni Residual] loaded {len(hasface)} hasface flags from {path}')
+    return hasface
+
+# ===== noise control experiment: fixed random vector per img_dir =====
+_NOISE_CACHE = {}
+def _get_noise_vec(d, std=1.0):
+    if d not in _NOISE_CACHE:
+        g = torch.Generator()
+        g.manual_seed(abs(hash(d)) % (2**31))
+        _NOISE_CACHE[d] = torch.randn(512, generator=g, dtype=torch.float32) * std
+    return _NOISE_CACHE[d]
+
+def build_omni_residual_batch(img_dirs, omni_feats_512, hasface_flags, device, use_noise=False, noise_std=1.0):
+    if use_noise:
+        _v, _m = [], []
+        for d in img_dirs:
+            _v.append(_get_noise_vec(d, noise_std))
+            _m.append(bool(hasface_flags.get(d, False)) if d in omni_feats_512 else False)
+        return torch.stack(_v, 0).to(device, non_blocking=True), torch.tensor(_m, dtype=torch.bool, device=device)
+    """返回 (omni_feat_global [B,512], face_mask [B] bool)"""
+    vecs, masks = [], []
+    for d in img_dirs:
+        if d in omni_feats_512:
+            vecs.append(omni_feats_512[d])
+            masks.append(bool(hasface_flags.get(d, False)))
+        else:
+            vecs.append(torch.zeros(512, dtype=torch.float32))
+            masks.append(False)
+    feats = torch.stack(vecs, dim=0).to(device, non_blocking=True)
+    face_mask = torch.tensor(masks, dtype=torch.bool, device=device)
+    return feats, face_mask
+
+
 def setlogger(log_file):
     filehandler = logging.FileHandler(log_file)
     streamhandler = logging.StreamHandler()
@@ -202,12 +239,17 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         # loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC,loss_Patch,loss_image_text_BIC = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos, alpha = alpha)  
         # with autocast():
         omni_valid_mask_batch = None
+        omni_feat_global_batch = None
+        omni_face_mask_batch = None
         if args.use_omni_fusion_local:
             omni_feat_batch, omni_valid_mask_batch = build_omni_batch_local(img_dir, omni_train_feats_local, omni_train_hasface_local, device)
+        elif args.use_omni_fusion_residual:
+            omni_feat_batch = None
+            omni_feat_global_batch, omni_face_mask_batch = build_omni_residual_batch(img_dir, omni_train_feats, omni_train_hasface_local, device, args.omni_noise_control, args.omni_noise_std)
         else:
             omni_feat_batch = build_omni_batch(img_dir, omni_train_feats, device)
         loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC, lossAnother = model(
-            image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch,alpha=alpha, omni_feat=omni_feat_batch, omni_valid_mask=omni_valid_mask_batch
+            image, label, text_input, fake_image_box, fake_token_pos, cap_input, prom_input, res_fake_pos, res_fake_pos_patch,alpha=alpha, omni_feat=omni_feat_batch, omni_valid_mask=omni_valid_mask_batch, omni_feat_global=omni_feat_global_batch, omni_face_mask=omni_face_mask_batch
         ) 
         loss = config['loss_MAC_wgt']*loss_MAC \
              + config['loss_BIC_wgt']*loss_BIC \
@@ -218,6 +260,12 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
              + 0.1 * lossAnother \
           
         loss.backward()
+        # 残差诊断实验：scheduler 会覆盖所有 param group 的 lr，
+        # 这里在 step 前强制把 alpha group 的 lr 拉回设定值
+        if args.use_omni_fusion_residual:
+            for _pg in optimizer.param_groups:
+                if _pg.get('is_alpha_group', False):
+                    _pg['lr'] = args.alpha_lr
         optimizer.step()    
         # scaler.scale(loss).backward()
         # scaler.step(optimizer)
@@ -233,6 +281,20 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         metric_logger.update(lossAnother=lossAnother.item())
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])         
+        if args.use_omni_fusion_residual:
+            _m = model.module if hasattr(model, 'module') else model
+            metric_logger.update(omni_alpha=_m.omni_residual_alpha.item())
+            if i < 20 or i % 100 == 0:
+                _a = _m.omni_residual_alpha
+                _g = _a.grad
+                _algrp = [g for g in optimizer.param_groups if g.get('is_alpha_group')]
+                _pw = _m.omni_residual_proj[1].weight.grad
+                print(f'[ALPHA-DBG] step={i} alpha={_a.item():.10f} '
+                      f'grad={"None" if _g is None else f"{_g.item():.3e}"} '
+                      f'group_lr={_algrp[0]["lr"] if _algrp else "NO_GROUP"} '
+                      f'proj_w_grad={"None" if _pw is None else f"{_pw.abs().mean().item():.3e}"} '
+                      f'face_ratio={float(omni_face_mask_batch.float().mean()) if omni_face_mask_batch is not None else "None"}',
+                      flush=True)
         
         if epoch==0 and i%step_size==0 and i<=warmup_iterations and config['schedular']['sched'] != 'cosine_in_step': 
             scheduler.step(i//step_size)   
@@ -301,11 +363,16 @@ def evaluation(args, model, data_loader, tokenizer, device, config, omni_val_fea
         prom_input = text_input_adjust(prom_input, fake_word_pos, device, True)
 
         omni_valid_mask_batch = None
+        omni_feat_global_batch = None
+        omni_face_mask_batch = None
         if args.use_omni_fusion_local:
             omni_feat_batch, omni_valid_mask_batch = build_omni_batch_local(img_dir, omni_val_feats_local, omni_val_hasface_local, device)
+        elif args.use_omni_fusion_residual:
+            omni_feat_batch = None
+            omni_feat_global_batch, omni_face_mask_batch = build_omni_residual_batch(img_dir, omni_val_feats, omni_val_hasface_local, device, args.omni_noise_control, args.omni_noise_std)
         else:
             omni_feat_batch = build_omni_batch(img_dir, omni_val_feats, device)
-        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch,is_train=False, omni_feat=omni_feat_batch, omni_valid_mask=omni_valid_mask_batch)
+        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch,is_train=False, omni_feat=omni_feat_batch, omni_valid_mask=omni_valid_mask_batch, omni_feat_global=omni_feat_global_batch, omni_face_mask=omni_face_mask_batch)
 
         ##================= real/fake cls ========================## 
         cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
@@ -472,6 +539,9 @@ def main_worker(gpu, args, config):
     if args.use_omni_fusion_local:
         omni_train_feats_local, omni_train_hasface_local = load_omni_feats_local('train')
         omni_val_feats_local, omni_val_hasface_local = load_omni_feats_local('val')
+    if args.use_omni_fusion_residual:
+        omni_train_hasface_local = load_omni_hasface('train')
+        omni_val_hasface_local = load_omni_hasface('val')
 
     # ========== Omni特征融合微调：先加载checkpoint，再冻结参数，最后才建optimizer ==========
     if args.checkpoint:    
@@ -492,7 +562,9 @@ def main_worker(gpu, args, config):
         #     print(msg)  
 
     # ========== 冻结除 omni_proj/omni_fusion_fc/cls_head/itm_head 外的所有参数 ==========
-    UNFROZEN_KEYWORDS = ('omni_proj', 'aggregator', 'cls_head', 'itm_head')
+    # 残差诊断实验：只解冻 OmniFD 通路 + 分类头，不解冻 aggregator，
+    # 保证 AUC 变化的唯一新增来源是 OmniFD 特征，alpha 的因果解释才干净
+    UNFROZEN_KEYWORDS = ('omni_residual', 'cls_head', 'itm_head')
     n_trainable = 0
     n_frozen = 0
     for name, param in model.named_parameters():
@@ -504,11 +576,43 @@ def main_worker(gpu, args, config):
             n_frozen += param.numel()
     if args.log:
         print(f'[Omni Fusion] trainable params: {n_trainable:,} | frozen params: {n_frozen:,}')
+        for _n, _p in model.named_parameters():
+            if 'omni_residual' in _n:
+                print(f'[Omni Residual] param {_n}: shape={tuple(_p.shape)}, requires_grad={_p.requires_grad}')
 
     arg_opt = utils.AttrDict(config['optimizer'])
     optimizer = create_optimizer(arg_opt, model)
+
+    # ========== 残差诊断实验：alpha 单独 param group ==========
+    # 理由1: alpha 是标量，用主干 lr(1.25e-6) 时 50epoch 也只能移动 ~0.27，
+    #        观察不到"增大/被压缩到0"的趋势，诊断标准无法判定
+    # 理由2: weight_decay 必须为 0——否则 alpha 会被 wd 持续拉向 0，
+    #        与"模型主动关闭 OmniFD 通路"的诊断信号混淆
+    if args.use_omni_fusion_residual:
+        _alpha_p = model.omni_residual_alpha
+        for _g in optimizer.param_groups:
+            _g['params'] = [p for p in _g['params'] if p is not _alpha_p]
+        optimizer.add_param_group({
+            'params': [_alpha_p],
+            'lr': args.alpha_lr,
+            'initial_lr': args.alpha_lr,
+            'weight_decay': 0.0,
+            'is_alpha_group': True,
+        })
+        if args.log:
+            print(f'[Omni Residual] alpha param group added: lr={args.alpha_lr}, weight_decay=0.0')
+            if args.omni_noise_control:
+                print(f'[NOISE CONTROL] *** OmniFD feats REPLACED by fixed random vectors (std={args.omni_noise_std}) ***')
+            print(f'[Omni Residual] total param groups = {len(optimizer.param_groups)}')
+
     arg_sche = utils.AttrDict(config['schedular'])
     lr_scheduler, _ = create_scheduler(arg_sche, optimizer)
+
+    # 注: 原本这里有一个 monkey patch 保护 alpha group 的 lr，
+    # 但局部函数无法被 pickle，保存 checkpoint 时会报错。
+    # 训练循环里 optimizer.step() 前已经强制把 alpha group 的 lr 拉回 args.alpha_lr，
+    # 效果等价且更稳，故移除。
+
     if config['schedular']['sched'] == 'cosine_in_step':
         args.lr = config['optimizer']['lr']
 
@@ -596,7 +700,9 @@ def main_worker(gpu, args, config):
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                             **{f'val_{k}': v for k, v in val_stats.items()},
                             'epoch': epoch,
+                            'omni_alpha': float(model_without_ddp.omni_residual_alpha.item()),
                         }             
+            print(f"[Omni Residual] epoch {epoch} | alpha = {model_without_ddp.omni_residual_alpha.item():.6f} | val AUC_cls = {val_stats['AUC_cls']}")
             with open(os.path.join(log_dir, "log.txt"),"a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
@@ -661,8 +767,14 @@ if __name__ == '__main__':
     parser.add_argument('--model_save_epoch', type=int, default=20)
     parser.add_argument('--token_momentum', default=False, action='store_true')
     parser.add_argument('--use_omni_fusion_local', action='store_true', help='是否启用OmniFD局部token序列融合（训练时解冻omni_proj+aggregator）')
+    parser.add_argument('--use_omni_fusion_residual', action='store_true', help='残差加和诊断实验：vision_feat + mask*alpha*proj(omni_global)，与--use_omni_fusion_local互斥')
+    parser.add_argument('--omni_noise_control', action='store_true', help='control exp: replace OmniFD feats with fixed random vectors')
+    parser.add_argument('--omni_noise_std', type=float, default=0.255, help='noise std, matches real OmniFD global std')
+    parser.add_argument('--alpha_lr', type=float, default=1e-3, help='omni_residual_alpha 专用学习率（独立param group，无weight_decay，不受cosine调度影响）')
 
     args = parser.parse_args()
+    assert not (args.use_omni_fusion_local and args.use_omni_fusion_residual), \
+        '--use_omni_fusion_local 与 --use_omni_fusion_residual 互斥，不能同时使用'
 
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
 

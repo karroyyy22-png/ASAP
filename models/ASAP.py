@@ -74,6 +74,12 @@ class ASAP(nn.Module):
         text_width = self.text_encoder.config.hidden_size
         self.omni_proj = nn.Linear(512, text_width)       # OmniFD 512维特征投影对齐维度
         self.omni_fusion_fc = nn.Linear(text_width * 2, text_width)  # 拼接后压缩回原维度
+        # ========== 残差加和诊断实验用模块（与局部token拼接方案并存，运行时互斥） ==========
+        self.omni_residual_proj = nn.Sequential(
+            nn.LayerNorm(512),
+            nn.Linear(512, text_width)
+        )
+        self.omni_residual_alpha = nn.Parameter(torch.tensor(0.1))
         self.vision_proj = nn.Linear(vision_width, embed_dim)
         self.text_proj = nn.Linear(text_width, embed_dim)         
 
@@ -200,7 +206,7 @@ class ASAP(nn.Module):
 
         loss = criterion(pre_patch, gt_patch)
         return loss
-    def forward(self, image, label, text, fake_image_box, fake_text_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch, alpha=0, is_train=True, omni_feat=None, omni_valid_mask=None):
+    def forward(self, image, label, text, fake_image_box, fake_text_pos, cap_input,prom_input,res_fake_pos,res_fake_pos_patch, alpha=0, is_train=True, omni_feat=None, omni_valid_mask=None, omni_feat_global=None, omni_face_mask=None):
         
         # 计算篡改置信度 s（目前用占位符0.5）
         # s = self.tamper_detector(image)   # [B]
@@ -357,6 +363,14 @@ class ASAP(nn.Module):
             loss_bbox, loss_giou = self.get_bbox_loss(output_coord, fake_image_box)
             ##================= Omni feature fusion (local token, cross-attn) ========================##
             vision_feat = local_feat_aggr.squeeze(1)
+            ##========== Omni residual fusion (诊断实验, 与local token方案互斥) ==========##
+            if omni_feat is None and omni_feat_global is not None:
+                omni_proj_out = self.omni_residual_proj(omni_feat_global)   # [B,512] -> [B,text_width]
+                if omni_face_mask is not None:
+                    mask = omni_face_mask.to(vision_feat.dtype).unsqueeze(-1)   # [B,1]
+                else:
+                    mask = torch.ones(vision_feat.size(0), 1, device=vision_feat.device, dtype=vision_feat.dtype)
+                vision_feat = vision_feat + mask * self.omni_residual_alpha * omni_proj_out
             if omni_feat is not None:
                 # omni_feat: [B, 64, 512], omni_valid_mask: [B, 64] (True=valid)
                 omni_tokens_proj = self.omni_proj(omni_feat)  # [B, 64, 512] -> [B, 64, text_width]
@@ -514,6 +528,14 @@ class ASAP(nn.Module):
             output_coord = self.bbox_head(local_feat_aggr.squeeze(1)).sigmoid()
             ##================= Omni feature fusion (local token, cross-attn) ========================##
             vision_feat = local_feat_aggr.squeeze(1)
+            ##========== Omni residual fusion (诊断实验, 与local token方案互斥) ==========##
+            if omni_feat is None and omni_feat_global is not None:
+                omni_proj_out = self.omni_residual_proj(omni_feat_global)   # [B,512] -> [B,text_width]
+                if omni_face_mask is not None:
+                    mask = omni_face_mask.to(vision_feat.dtype).unsqueeze(-1)   # [B,1]
+                else:
+                    mask = torch.ones(vision_feat.size(0), 1, device=vision_feat.device, dtype=vision_feat.dtype)
+                vision_feat = vision_feat + mask * self.omni_residual_alpha * omni_proj_out
             if omni_feat is not None:
                 omni_tokens_proj = self.omni_proj(omni_feat)
 

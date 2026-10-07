@@ -36,3 +36,9 @@ Prompt_Generate/*.json
 asap_files.txt
 dataset/prompt_engine.json
 .vscode/
+
+# 个人练手目录（结构化测试），不提交
+gold/
+
+# 残差融合的一次性补丁脚本（初版，与当前代码不一致），不提交
+patch_omni_residual.py
