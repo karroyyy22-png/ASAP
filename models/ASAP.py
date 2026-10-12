@@ -133,7 +133,7 @@ class ASAP(nn.Module):
 
         self.norm_layer_it_cross_atten =nn.LayerNorm(text_width)
         self.it_cross_attn = Multilmodelattention(text_width, 12)
-        # self.UtilsC = nn.Parameter(torch.tensor(0.5))
+        self.UtilsC = nn.Parameter(torch.tensor(0.5))  # [phase0] 恢复：0602 checkpoint 训练时 MLC 用的是 UtilsC
 
         # 临时占位：先用常数0.5，后面替换成真正的模型
         # self.fake_s = 0.5
@@ -446,7 +446,7 @@ class ASAP(nn.Module):
 
             # output_cls = self.cls_head(final_feat)
 
-            output_cls = self.cls_head(text_feat + self.UtilsB * vision_feat)
+            output_cls = self.cls_head(text_feat + self.UtilsC * vision_feat)  # [phase0] 恢复 UtilsC
 
             loss_MLC = F.binary_cross_entropy_with_logits(output_cls, multicls_label.type(torch.float))          
             ##================= TMG ========================##    
@@ -562,7 +562,7 @@ class ASAP(nn.Module):
             logits_real_fake = self.itm_head(output_pos.last_hidden_state[:,0,:] + self.UtilsB * vision_feat)
             ##================= MLC ========================## 
             text_feat = output_pos.last_hidden_state[:,0,:]
-            logits_multicls = self.cls_head(text_feat + self.UtilsB * vision_feat)
+            logits_multicls = self.cls_head(text_feat + self.UtilsC * vision_feat)  # [phase0] 恢复 UtilsC
             ##================= TMG ========================##   
             input_ids = text.input_ids.clone()
             logits_tok = self.text_encoder(input_ids, 
